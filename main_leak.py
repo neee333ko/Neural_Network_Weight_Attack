@@ -16,6 +16,10 @@ from attack.BFA import *
 import torch.nn.functional as F
 import copy
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'spikingjelly')))
+from spikingjelly.activation_based import surrogate, neuron, functional
+
+
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
@@ -25,6 +29,12 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(
     description='Training network for image classification',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+
+parser.add_argument('--time_step',
+                    default=20,
+                    type=int,
+                    help='timestep')
 
 parser.add_argument('--data_path',
                     default='/home/tongou.wei/dataset/',
@@ -52,7 +62,7 @@ parser.add_argument('--optimizer',
                     choices=['SGD', 'Adam', 'YF'])
 parser.add_argument('--test_batch_size',
                     type=int,
-                    default=50,
+                    default=25,
                     help='Batch size.')
 parser.add_argument('--learning_rate',
                     type=float,
@@ -118,7 +128,7 @@ parser.add_argument('--gpu_id',
                     help='device range [0,ngpu-1]')
 parser.add_argument('--workers',
                     type=int,
-                    default=4,
+                    default=16,
                     help='number of data loading workers (default: 2)')
 # random seed
 parser.add_argument('--manualSeed', type=int, default=None, help='manual seed')
@@ -140,7 +150,7 @@ parser.add_argument('--bfa',
                     help='enable the bit-flip attack')
 parser.add_argument('--attack_sample_size',
                     type=int,
-                    default=50,
+                    default=25,
                     help='attack sample size')
 parser.add_argument('--n_iter',
                     type=int,
@@ -174,6 +184,8 @@ if args.use_cuda:
     torch.cuda.manual_seed_all(args.manualSeed)
 
 cudnn.benchmark = True
+
+device = torch.device("cuda" if args.use_cuda else "cpu")
 
 ###############################################################################
 ###############################################################################
@@ -323,7 +335,23 @@ def main():
 
     # Init model, criterion, and optimizer
     net = models.__dict__[args.arch](num_classes)
+    net.to(device)
     print_log("=> network :\n {}".format(net), log)
+    
+    
+    # initialize tau
+    for i, (input, target) in enumerate(train_loader):
+        target = target.to(device, non_blocking=True)
+        input = input.to(device, non_blocking=True)
+
+        # compute output
+        _ = net(input)
+        
+        functional.reset_net(net)
+
+        break
+    
+    
 
     if args.use_cuda:
         if args.ngpu > 1:
@@ -335,12 +363,13 @@ def main():
     # separate the parameters thus param groups can be updated by different optimizer
     all_param = [
         param for name, param in net.named_parameters()
-        if not 'step_size' in name
+        if not name.endswith('.w') and 'step_size' not in name
     ]
 
     step_param = [
         param for name, param in net.named_parameters() if 'step_size' in name
     ]
+    
 
     if args.optimizer == "SGD":
         print("using SGD as optimizer")
@@ -352,15 +381,24 @@ def main():
 
     elif args.optimizer == "Adam":
         print("using Adam as optimizer")
-        optimizer = torch.optim.Adam(filter(lambda param: param.requires_grad,
-                                            net.parameters()),
+        optimizer = torch.optim.Adam([
+                                        param
+                                        for name, param in net.named_parameters()
+                                        if param.requires_grad 
+                                        and not name.endswith('.w')
+                                    ],
                                      lr=state['learning_rate'],
                                      weight_decay=state['decay'])
 
     elif args.optimizer == "RMSprop":
         print("using RMSprop as optimizer")
         optimizer = torch.optim.RMSprop(
-            filter(lambda param: param.requires_grad, net.parameters()),
+            [
+                param
+                for name, param in net.named_parameters()
+                if param.requires_grad
+                and not name.endswith('.w')
+            ],
             lr=state['learning_rate'],
             alpha=0.99,
             eps=1e-08,
@@ -458,6 +496,7 @@ def main():
     # Main loop
     start_time = time.time()
     epoch_time = AverageMeter()
+    
 
     for epoch in range(args.start_epoch, args.epochs):
         current_learning_rate, current_momentum = adjust_learning_rate(
@@ -513,11 +552,17 @@ def main():
 
         ## Log the graidents distribution
         for name, param in net.named_parameters():
+            if param.grad is None:
+                continue   
+
             name = name.replace('.', '/')
-            writer.add_histogram(name + '/grad',
-                                 param.grad.clone().cpu().data.numpy(),
-                                 epoch + 1,
-                                 bins='tensorflow')
+            writer.add_histogram(
+                name + '/grad',
+                param.grad.detach().cpu().numpy(),
+                epoch + 1,
+                bins='tensorflow'
+            )
+
 
         # ## Log the weight and bias distribution
         for name, module in net.named_modules():
@@ -553,8 +598,9 @@ def perform_attack(attacker, model, model_clean, train_loader, test_loader,
     # attempt to use the training data to conduct BFA
     for _, (data, target) in enumerate(train_loader):
         if args.use_cuda:
-            target = target.cuda(async=True)
-            data = data.cuda()
+            target = target.to(device, non_blocking=True)
+            data = data.to(device, non_blocking=True)
+            
         # Override the target to prevent label leaking
         _, target = model(data).data.max(1)
         break
@@ -636,17 +682,24 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
         data_time.update(time.time() - end)
 
         if args.use_cuda:
-            target = target.cuda(
-                async=True
-            )  # the copy will be asynchronous with respect to the host.
-            input = input.cuda()
+            target = target.to(device, non_blocking=True)
+            input = input.to(device, non_blocking=True)
+
+        output_fr = 0.
+
+        for t in range(args.time_step):
+            output_fr += model(input)
+
+        output_fr = output_fr / args.time_step
+
+        functional.reset_net(model)
 
         # compute output
-        output = model(input)
-        loss = criterion(output, target)
+        # output = model(input)
+        loss = criterion(output_fr, target)
 
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+        prec1, prec5 = accuracy(output_fr.data, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
         top5.update(prec5.item(), input.size(0))
@@ -655,6 +708,30 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+
+        for m in model.modules():
+            if not isinstance(m, neuron.ParametricQuanLIFNode):
+                continue
+
+            prev = m.pre_layer
+            if prev is None or prev.weight.grad is None:
+                continue
+
+            lr = optimizer.param_groups[0]['lr']
+
+            if isinstance(prev, quan_Conv2d):
+                grad_signal = prev.weight.grad.abs().mean(dim=(1, 2, 3))
+                grad_signal = grad_signal.view(-1, 1, 1)
+
+                m.w.data -= lr * m.w.grad.data + 1e-6 * grad_signal
+
+            elif isinstance(prev, quan_Linear):
+                grad_signal = prev.weight.grad.abs().mean(dim=1)
+
+                m.w.data -= lr * m.w.grad.data + 1e-6 * grad_signal
+
+                        
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -693,15 +770,20 @@ def validate(val_loader, model, criterion, log):
     with torch.no_grad():
         for i, (input, target) in enumerate(val_loader):
             if args.use_cuda:
-                target = target.cuda(async=True)
-                input = input.cuda()
+                target = target.to(device, non_blocking=True)
+                input = input.to(device, non_blocking=True)
 
             # compute output
-            output = model(input)
-            loss = criterion(output, target)
+            output_fr = 0.
+            for t in range(args.time_step):
+                output_fr += model(input)
+            output_fr /= args.time_step
+            functional.reset_net(model)
+
+            loss = criterion(output_fr, target)
 
             # measure accuracy and record loss
-            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+            prec1, prec5 = accuracy(output_fr.data, target, topk=(1, 5))
             losses.update(loss.item(), input.size(0))
             top1.update(prec1.item(), input.size(0))
             top5.update(prec5.item(), input.size(0))
@@ -763,7 +845,7 @@ def accuracy(output, target, topk=(1, )):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0)
+            correct_k = correct[:k].reshape(-1).float().sum(0)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 

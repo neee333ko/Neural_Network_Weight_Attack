@@ -6,3 +6,6 @@ benchmark/
 models/__pycache__/
 
 *.pyc
+
+log/
+save/
