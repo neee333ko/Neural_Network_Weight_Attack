@@ -52,7 +52,7 @@ parser.add_argument('--optimizer',
                     choices=['SGD', 'Adam', 'YF'])
 parser.add_argument('--test_batch_size',
                     type=int,
-                    default=50,
+                    default=25,
                     help='Batch size.')
 parser.add_argument('--learning_rate',
                     type=float,
@@ -118,7 +118,7 @@ parser.add_argument('--gpu_id',
                     help='device range [0,ngpu-1]')
 parser.add_argument('--workers',
                     type=int,
-                    default=4,
+                    default=16,
                     help='number of data loading workers (default: 2)')
 # random seed
 parser.add_argument('--manualSeed', type=int, default=None, help='manual seed')
@@ -140,7 +140,7 @@ parser.add_argument('--bfa',
                     help='enable the bit-flip attack')
 parser.add_argument('--attack_sample_size',
                     type=int,
-                    default=50,
+                    default=25,
                     help='attack sample size')
 parser.add_argument('--n_iter',
                     type=int,

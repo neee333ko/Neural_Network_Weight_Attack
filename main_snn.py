@@ -219,8 +219,8 @@ def main():
         os.makedirs(args.data_path)
 
     if args.dataset == 'cifar10':
-        mean = [x / 255 for x in [125.3, 123.0, 113.9]]
-        std = [x / 255 for x in [63.0, 62.1, 66.7]]
+        mean = [0.5,0.5,0.5]
+        std = [0.5,0.5,0.5]
     elif args.dataset == 'cifar100':
         mean = [x / 255 for x in [129.3, 124.1, 112.4]]
         std = [x / 255 for x in [68.2, 65.4, 70.4]]
@@ -251,8 +251,8 @@ def main():
         ])  # here is actually the validation dataset
     else:
         train_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(32, padding=4),
+            # transforms.RandomHorizontalFlip(),
+            # transforms.RandomCrop(32, padding=4),
             transforms.ToTensor(),
             transforms.Normalize(mean, std)
         ])
@@ -363,7 +363,7 @@ def main():
     # separate the parameters thus param groups can be updated by different optimizer
     all_param = [
         param for name, param in net.named_parameters()
-        if not name.endswith('.w') and 'step_size' not in name
+        if 'step_size' not in name
     ]
 
     step_param = [
@@ -385,7 +385,6 @@ def main():
                                         param
                                         for name, param in net.named_parameters()
                                         if param.requires_grad 
-                                        and not name.endswith('.w')
                                     ],
                                      lr=state['learning_rate'],
                                      weight_decay=state['decay'])
@@ -397,7 +396,6 @@ def main():
                 param
                 for name, param in net.named_parameters()
                 if param.requires_grad
-                and not name.endswith('.w')
             ],
             lr=state['learning_rate'],
             alpha=0.99,
@@ -707,28 +705,6 @@ def train(train_loader, model, criterion, optimizer, epoch, log):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
-
-
-        for m in model.modules():
-            if not isinstance(m, neuron.ParametricQuanLIFNode):
-                continue
-
-            prev = m.pre_layer
-            if prev is None or prev.weight.grad is None:
-                continue
-
-            lr = optimizer.param_groups[0]['lr']
-
-            if isinstance(prev, quan_Conv2d):
-                grad_signal = prev.weight.grad.abs().mean(dim=(1, 2, 3))
-                grad_signal = grad_signal.view(-1, 1, 1)
-
-                m.w.data -= lr * m.w.grad.data + 1e-6 * grad_signal
-
-            elif isinstance(prev, quan_Linear):
-                grad_signal = prev.weight.grad.abs().mean(dim=1)
-
-                m.w.data -= lr * m.w.grad.data + 1e-6 * grad_signal
 
         optimizer.step() 
 
